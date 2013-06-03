@@ -345,7 +345,7 @@ add_metric_value(Vals, Event) ->
 
 set_event_host(Event) ->
   case Event#riemannevent.host of
-    undefined -> Event#riemannevent{host = default_node_name()};
+    undefined -> Event#riemannevent{host = default_host_name()};
     _ -> Event
   end.
 
@@ -357,7 +357,7 @@ create_state(Vals) ->
 
 set_state_host(State) ->
   case State#riemannstate.host of
-    undefined -> State#riemannstate{host = default_node_name()};
+    undefined -> State#riemannstate{host = default_host_name()};
     _ -> State
   end.
 
@@ -380,8 +380,10 @@ create_base(Vals, I, F, AdditionalFields) ->
           end
       end, I, [time, state, service, host, description, tags, ttl | AdditionalFields]).
 
-default_node_name() ->
-  atom_to_list(node()).
+default_host_name() ->
+  NodeList = atom_to_list(node()),
+  [_, Host] = string:tokens(NodeList, "@"),
+  Host.
 
 str(V) when is_atom(V) -> atom_to_list(V);
 str(V) -> V.
@@ -417,21 +419,21 @@ set_metric_value_test() ->
   ?assertEqual(1.0, E2#riemannevent.metric_f).
 
 default_node_name_test() ->
-  ?assertEqual("nonode@nohost", default_node_name()).
+  ?assertEqual("nohost", default_host_name()).
 
 set_event_host_test() ->
   E = #riemannevent{host = "host"},
   E1 = set_event_host(E),
   ?assertEqual("host", E1#riemannevent.host),
   E2 = set_event_host(#riemannevent{}),
-  ?assertEqual(default_node_name(), E2#riemannevent.host).
+  ?assertEqual(default_host_name(), E2#riemannevent.host).
 
 set_state_host_test() ->
   E = #riemannstate{host = "host"},
   E1 = set_state_host(E),
   ?assertEqual("host", E1#riemannstate.host),
   E2 = set_state_host(#riemannstate{}),
-  ?assertEqual(default_node_name(), E2#riemannstate.host).
+  ?assertEqual(default_host_name(), E2#riemannstate.host).
 
 -record(c, {
     tcp,
