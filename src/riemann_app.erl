@@ -21,7 +21,7 @@
 -behaviour(application).
 
 %% Application callbacks
--export([start/2, stop/1]).
+-export([start/2, stop/1, config_change/3]).
 
 %% ===================================================================
 %% Application callbacks
@@ -31,4 +31,8 @@ start(_StartType, _StartArgs) ->
   riemann_sup:start_link().
 
 stop(_State) ->
+  ok.
+
+config_change(_Changed, _New, _Removed) ->
+  riemann:reconfigure(),
   ok.
