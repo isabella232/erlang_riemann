@@ -59,12 +59,19 @@
 
 -include("riemann_pb.hrl").
 
+-record(client, {
+    host = undefined,
+    port = undefined,
+    socket = undefined,
+    last_connected_at = -1}).
+
 -record(state, {
     tcp_client = undefined,
     udp_client = undefined
 }).
 
 -define(UDP_MAX_SIZE, 16384).
+-define(MIN_RECONNECT_INTERVAL, 30). % 30 seconds
 
 -opaque riemann_event() :: #riemannevent{}.
 -opaque riemann_state() :: #riemannstate{}.
@@ -148,9 +155,13 @@ reconfigure() ->
 %%% gen_server callbacks
 %%%===================================================================
 
+unixtime() ->
+  {Mega, Secs, _} = now(),
+  Mega * 1000000 + Secs.
+
 init(_) ->
-  {UdpClient, TcpClient} = setup_riemann_connectivity(),
-  {ok, #state{tcp_client = TcpClient, udp_client = UdpClient}}.
+  State = setup_riemann_connectivity(),
+  {ok, State}.
 
 handle_call({send_with_tcp, Entities}, _From, S0) ->
   {Reply, S1} = case send_with_tcp(Entities, S0) of
@@ -175,8 +186,8 @@ handle_call({run_query, Query}, _From, S0) ->
 
 handle_call(reconfigure, _From, State) ->
   terminate(reconfigure, State),
-  {UdpClient, TcpClient} = setup_riemann_connectivity(),
-  {reply, ok, #state{tcp_client = TcpClient, udp_client = UdpClient}};
+  State = setup_riemann_connectivity(),
+  {reply, ok, State};
 
 handle_call(_Request, _From, State) ->
   Reply = ok,
@@ -193,12 +204,14 @@ handle_info(_Info, State) ->
 
 terminate(_Reason, #state{udp_client=UdpClient, tcp_client=TcpClient}) ->
   case UdpClient of
-    undefined -> ok;
-    {_, _, UdpSocket} -> gen_udp:close(UdpSocket)
+    #client{socket = UdpSocket} when UdpSocket =/= undefined ->
+      gen_udp:close(UdpSocket);
+    _ -> ok
   end,
   case TcpClient of
-    undefined -> ok;
-    {_, _, TcpSocket} -> gen_tcp:close(TcpSocket)
+    #client{socket = TcpSocket} when TcpSocket =/= undefined ->
+      gen_tcp:close(TcpSocket);
+    _ -> ok
   end,
   ok.
 
@@ -210,32 +223,46 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 
 setup_riemann_connectivity() ->
+  UdpClient = setup_client(udp),
+  TcpClient = setup_client(tcp),
+  #state{tcp_client = TcpClient, udp_client = UdpClient}.
+
+setup_client(Protocol) ->
   Clients = get_env(clients, []),
-  {ok, UdpClient} = setup_client(proplists:lookup(udp, Clients)),
-  TcpClient = case setup_client(proplists:lookup(tcp, Clients)) of
-    {ok, Client} -> Client;
-    {error, Reason} ->
-      lager:error("Failed opening a tcp socket to riemann with reason ~p", [Reason]),
+  case proplists:lookup(Protocol, Clients) of
+    {Protocol, Host, Port} ->
+      setup_client(Protocol, Host, Port);
+    none ->
       undefined
-  end,
-  {UdpClient, TcpClient}.
+  end.
 
-setup_client(none) -> {ok, undefined};
+setup_client(Protocol, Host, Port) ->
+  case setup_socket(Protocol, Host, Port) of
+    {ok, Socket} ->
+      #client{host = Host, port = Port, socket = Socket, last_connected_at = unixtime()};
+    {error, Reason} ->
+      lager:error("Failed opening a ~p socket to riemann with reason ~p", [Protocol, Reason]),
+      #client{host = Host, port = Port, last_connected_at = unixtime()}
+  end.
 
-setup_client({udp, Host, Port}) ->
-  {ok, UdpSocket} = gen_udp:open(0, [binary, {active,false}]),
-  {ok, {Host, Port, UdpSocket}};
+setup_socket(udp, _Host, _Port) ->
+  gen_udp:open(0, [binary, {active, false}]);
 
-setup_client({tcp, Host, Port}) ->
+setup_socket(tcp, Host, Port) ->
   Options = [binary, {active,false}, {keepalive, true}, {nodelay, true}],
   Timeout = 10000,
-  case gen_tcp:connect(Host, Port, Options, Timeout) of
-    {ok, TcpSocket} ->
-      ok = gen_tcp:controlling_process(TcpSocket, self()),
-      {ok, {Host, Port, TcpSocket}};
-    {error, Reason} ->
-      {error, Reason}
-  end.
+  gen_tcp:connect(Host, Port, Options, Timeout).
+
+reconnect_client(Protocol, #client{last_connected_at = LastConnectedAt} = Client) ->
+  reconnect_client(Protocol, Client, ?MIN_RECONNECT_INTERVAL < unixtime() - LastConnectedAt).
+
+reconnect_client(Protocol, #client{}, false) ->
+  {error, cooldown};
+
+reconnect_client(Protocol, #client{host = Host, port = Port}, true) ->
+  {ok, setup_client(Protocol, Host, Port)}.
+
+
 
 get_env(Name, Default) ->
   case application:get_env(riemann, Name) of
@@ -264,7 +291,16 @@ send_with_tcp(_, #state{tcp_client=undefined} = State) ->
   lager:warning("Failed sending entities to riemann because tcp client is undefined"),
   {{error, tcp_client_undefined}, State};
 
-send_with_tcp(Entities, #state{tcp_client={Host, Port, TcpSocket}}=State) ->
+send_with_tcp(Entities, #state{tcp_client = #client{socket = undefined} = Client} = State) ->
+  case reconnect_client(tcp, Client) of
+    {ok, NewClient} ->
+      NewState = State#state{tcp_client = NewClient},
+      send_with_tcp(Entities, NewState);
+    {error, Reason} ->
+      {{error, Reason}, State}
+  end;
+
+send_with_tcp(Entities, #state{tcp_client = #client{socket = TcpSocket} = Client} = State) ->
   BinMsg = encode_entities(Entities),
   MessageSize = byte_size(BinMsg),
   MsgWithLength = <<MessageSize:32/integer-big, BinMsg/binary>>,
@@ -273,9 +309,9 @@ send_with_tcp(Entities, #state{tcp_client={Host, Port, TcpSocket}}=State) ->
       {await_reply(TcpSocket), State};
     {error, closed} ->
       lager:info("Connection to riemann is closed. Reestablishing connection."),
-      case setup_client({tcp, Host, Port}) of
+      case reconnect_client(tcp, Client, true) of
         {ok, NewTcpClient} ->
-          send_with_tcp(BinMsg, State#state{tcp_client = NewTcpClient});
+          send_with_tcp(Entities, State#state{tcp_client = NewTcpClient});
         {error, Reason} ->
           lager:error("Re-establishing a tcp connection to riemann failed because of ~p", [Reason]),
           {{error, Reason}, State}
@@ -299,11 +335,25 @@ send_with_udp(_, #state{udp_client=undefined} = State) ->
   lager:warning("Failed sending entities to riemann because udp client is undefined"),
   {{error, udp_client_undefined}, State};
 
-send_with_udp(Entities, #state{udp_client={Host, Port, UdpSocket}} = State) ->
-  Responses = [{E, gen_udp:send(UdpSocket, Host, Port, encode_entities([E]))} || E <- Entities],
-  case [{Entity, Reason} || {Entity, {error, Reason}} <- Responses] of
+send_with_udp(Entities, #state{udp_client = #client{socket = undefined} = Client} = State) ->
+  case reconnect_client(udp, Client) of
+    {ok, NewClient} ->
+      NewState = State#state{udp_client = NewClient},
+      send_with_udp(Entities, NewState);
+    {error, Reason} ->
+      {{error, Reason}, State}
+  end;
+
+send_with_udp(Entities, #state{udp_client=#client{host = Host, port = Port, socket = UdpSocket}} = State) ->
+  ErrorResponses = lists:foldl(fun(Entity, ErrorResponses) ->
+      case gen_udp:send(UdpSocket, Host, Port, encode_entities([Entity])) of
+        {error, Reason} -> [{Entity, Reason} | ErrorResponses];
+        _ -> ErrorResponses
+      end
+    end, [], Entities),
+  case ErrorResponses of
     [] -> {ok, State};
-    Reasons -> {{error, Reasons}, State}
+    _ -> {{error, ErrorResponses}, State}
   end.
 
 decode_response(<<MsgLength:32/integer-big, Data/binary>>) ->
@@ -477,7 +527,7 @@ end_to_end_udp(E, F) ->
     stop()
   end.
 
-end_to_end_event_state_tcp_test() ->
+tcp_data() ->
   Events = [event([{service, "test service"}, {state, "ok"}, {time, 1000020202}]) || _ <- lists:seq(1, 350)],
   States = [state([{service, "test service"}, {state, "ok"}, {time, 1000020202}]) || _ <- lists:seq(1, 350)],
   F = fun(#riemannmsg{
@@ -488,30 +538,58 @@ end_to_end_event_state_tcp_test() ->
           (_) -> 
       false
   end,
-  end_to_end_tcp(lists:flatten([Events,States]), F).
+  {lists:flatten([Events,States]), F}.
+
+end_to_end_disconnected_tcp_test() ->
+  application:set_env(riemann, clients, [{udp, "127.0.0.1", 5555}, {tcp, "127.0.0.1", 5555}]),
+  {Events, _} = tcp_data(),
+  start_link(),
+  Response = send_tcp(Events),
+  ?assertEqual({error,cooldown}, Response),
+  stop().
+
+
+end_to_end_reconnect_tcp_test() ->
+  {Entities, Validator} = tcp_data(),
+  C = conn(),
+  start_link(),
+  (C#c.close)(),
+  C1 = conn(),
+  try
+    send_and_recv_tcp(Entities, Validator, C1)
+  after
+    (C1#c.close)(),
+    stop()
+  end.
+
+end_to_end_event_state_tcp_test() ->
+  {Entities, Validator} = tcp_data(),
+  end_to_end_tcp(Entities, Validator).
 
 end_to_end_tcp(Es, Validate) ->
   C = conn(),
   try
     start_link(),
-    S = self(),
-    spawn(fun() ->
-          R = send_tcp(Es),
-          S ! {result, R}
-      end),
-    {ok, Socket} = gen_tcp:accept(C#c.tcp),
-    {ok, <<Length:32/integer-big>>} = gen_tcp:recv(Socket, 4),
-    {ok, BinMsg} = gen_tcp:recv(Socket, Length),
-    ?assert(Validate(riemann_pb:decode_riemannmsg(BinMsg))),
-    Reply = iolist_to_binary(riemann_pb:encode_riemannmsg(#riemannmsg{
-        ok = true
-    })),
-    gen_tcp:send(Socket, <<(byte_size(Reply)):32/integer-big, Reply/binary>>),
-    gen_tcp:close(Socket),
-    receive {result, ok} -> ok end
+    send_and_recv_tcp(Es, Validate, C)
   after
     (C#c.close)(),
     stop()
   end.
 
+send_and_recv_tcp(Es, Validate, C) ->
+  S = self(),
+  spawn(fun() ->
+        R = send_tcp(Es),
+        S ! {result, R}
+    end),
+  {ok, Socket} = gen_tcp:accept(C#c.tcp),
+  {ok, <<Length:32/integer-big>>} = gen_tcp:recv(Socket, 4),
+  {ok, BinMsg} = gen_tcp:recv(Socket, Length),
+  ?assert(Validate(riemann_pb:decode_riemannmsg(BinMsg))),
+  Reply = iolist_to_binary(riemann_pb:encode_riemannmsg(#riemannmsg{
+      ok = true
+  })),
+  gen_tcp:send(Socket, <<(byte_size(Reply)):32/integer-big, Reply/binary>>),
+  gen_tcp:close(Socket),
+  receive {result, ok} -> ok end.
 -endif.
