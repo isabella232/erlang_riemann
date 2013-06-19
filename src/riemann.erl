@@ -293,7 +293,7 @@ send_with_tcp(_, #state{tcp_client=undefined} = State) ->
 
 send_with_tcp(Entities, #state{tcp_client = #client{socket = undefined} = Client} = State) ->
   case reconnect_client(tcp, Client) of
-    {ok, NewClient} ->
+    {ok, #client{socket = Socket} = NewClient} when Socket =/= undefined ->
       NewState = State#state{tcp_client = NewClient},
       send_with_tcp(Entities, NewState);
     {error, Reason} ->
