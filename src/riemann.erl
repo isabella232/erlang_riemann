@@ -186,8 +186,8 @@ handle_call({run_query, Query}, _From, S0) ->
 
 handle_call(reconfigure, _From, State) ->
   terminate(reconfigure, State),
-  State = setup_riemann_connectivity(),
-  {reply, ok, State};
+  NewState = setup_riemann_connectivity(),
+  {reply, ok, NewState};
 
 handle_call(_Request, _From, State) ->
   Reply = ok,
@@ -256,7 +256,7 @@ setup_socket(tcp, Host, Port) ->
 reconnect_client(Protocol, #client{last_connected_at = LastConnectedAt} = Client) ->
   reconnect_client(Protocol, Client, ?MIN_RECONNECT_INTERVAL < unixtime() - LastConnectedAt).
 
-reconnect_client(Protocol, #client{}, false) ->
+reconnect_client(_Protocol, #client{}, false) ->
   {error, cooldown};
 
 reconnect_client(Protocol, #client{host = Host, port = Port}, true) ->
